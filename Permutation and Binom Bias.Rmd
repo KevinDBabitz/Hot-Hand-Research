@@ -1,0 +1,312 @@
+---
+title: "Hot Hand Research"
+output: html_document
+---
+
+## Import Libraries
+
+```{r Import Libraries}
+library(pacman)
+pacman::p_load(tidyverse, gtools, pbapply, future.apply)
+plan(multiprocess)
+```
+
+## Simulation Helper Functions
+
+These 3 functions are used in the other functions to help find different values of interest after a simulation is run. 
+
+find.runs(x) breaks a vector into a data frame of runs with starting and ending indices and the value of the run (1 or 0 in this case). 
+
+find.after.run.inds(x, k, value) finds the indices of all indices after a run of a specified value and length k and returns a vector of those runs.
+
+make_sequence(n, p, padding, k) creates a sequence of length n with probability of success (1) of p and failure (0) 1 - p. If padding is true, the sequence will have an additional k values added to the sequence that are simulated using a probability of p. If padding is true, the sequence is generated using a permutation and the padding is generated using a binomial. If it is false, the sequence is just n * p 1s and n * (1 - p) 0s in order and must be permuted after being called. 
+
+```{r Find Runs and After Run Indices}
+#Given a vector x, find the runs where a player made the shots
+find.runs = function(x) {
+  rle_x <- rle(x)
+  # Compute endpoints of run
+  len <- rle_x$lengths
+  end <- cumsum(len)
+  start <- c(1, end[-length(end)]+1)
+  data.frame(val=rle_x$values, len=len,start=start, end=end)
+}
+
+# Given a vector x, a streak length k, and a value (1 = make, 0 = miss) find 
+# The Indices after a streak (to see the result)
+# Return NaN if no runs
+find.after.run.inds <- function(x,k,value=1) {
+  runs <- find.runs(x)
+  
+  # Keep only runs of specified value 
+  # that have at least length k
+  runs <- runs[runs$len>=k & runs$val==value,,drop=FALSE]
+  
+  if (NROW(runs)==0)
+    return(NaN)
+  
+  # Index directly after runs of length k
+  inds <- runs$start+k
+  max.len <- max(runs$len)
+  len = k+1
+  while (len <= max.len) {
+    runs = runs[runs$len >= len,,drop=FALSE]
+    inds = c(inds,runs$start+len)
+    len = len+1
+  }
+  # ignore indices above n and sort for convenience
+  inds <- sort(inds[inds<=length(x)])
+  inds
+}
+
+make_sequence <- function(n, p, padding = FALSE, k = 3) {
+  if (padding) {
+    # assume will want permuted if padding is true
+    pad <- rbinom(k, 1, p)
+    seq <- c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p)))
+    seq <- permute(seq)
+    return (c(pad, seq))
+  }
+  else
+    return (c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p))))
+  
+}
+```
+
+## Simulation Using Binomials
+
+bias.calc(x, n, k, pi. pad) finds all of the values of interest for our analysis of sequences. This function outputs a tibble with calculations for an individual sequence of 1s and 0s.  
+
+x - a vector of 1s and 0s, n represents the length of the sequence 
+k - the length of a "hot streak"
+pi - the true probability of a success for the sequence  
+pad - boolean value checking if we have a padding at the beginning of the sequence (padding is a sequence of shots to see if the player is hot before the first shot for calculations later). 
+
+
+```{r Simulation Function With Binomials}
+# Find the bias (shot prob after streak - overall shot probability)
+# X is a vector generated from a binomial
+bias.calc <- function(x, n, k, pi, pad = FALSE) {
+  # Find these indeces of x that come directly
+  # after a streak of k elements of specified value
+  hot.inds <- find.after.run.inds(x, k, value=1)
+  cold.inds <- find.after.run.inds(x, k, value=0)
+
+  if (pad) {
+    p_hat <- mean(x[4:length(x)])
+  } else {
+    p_hat <- mean(x)
+  }
+  
+  # If no run of at least k subsequent numbers of value exists
+  # return NULL (we will dismiss this observation)
+  tib <- tibble(pi = pi, 
+         n = n,
+         k = k,
+         p_k_hot = mean(x[hot.inds]),
+         p_k_cold = mean(x[cold.inds]),
+         p_hat = p_hat,
+         bias_p_hat = p_k_hot - p_hat,
+         bias_p = p_k_hot - pi,
+         hot_cold_bias = p_k_hot - p_k_cold,
+         n_k_hot = length(hot.inds),
+         n_k_cold = length(cold.inds)
+    )
+  tib$n_k_hot[which(is.na(tib$p_k_hot))] <- 0
+  tib$n_k_cold[which(is.na(tib$p_k_cold))] <- 0
+  return(tib)
+}
+```
+
+This first chunk of code looks at binomial generated sequences of different length  from 10 to 200 increasing by 10 each time. The data frames generated from this code are:
+
+1. binom.trials.n - a matrix of all of the binomial sequences (of 1s and 0s) generated of varrying length based on the n parameter.
+2. binom.data.n - a data frame of summary data for each individual trial in binom.trials.n
+3. binom.summary.n - a data frame with aggregated data grouped by each value of n being looked at.
+
+```{r Binomial Data With Fixed p .5, k 3, Changing n}
+
+# Generate 10,000 binomial sequences for each value of n with fixed probability 0.5
+n <- seq(10, 200, 10)
+binom.trials.n <- list()
+for (i in 1:length(n)) {
+  binom.trials.n[[i]] <- as.matrix(replicate(10000, rbinom(n[i], 1, .5)))
+}
+
+# Gather the data for each of these sequences of different values of n. The result will be one tibble with summary data for each of the sequences generated in one tibble called binom.data.n
+binom.data.n <- list()
+for (i in 1:length(n)) {
+  binom.data.n[[i]] <- bind_rows(future_apply(binom.trials.n[[i]], 2, bias.calc, n = n[i], k = 3, pi = .5))
+}
+# Convert into 1 tibble
+binom.data.n <- bind_rows(binom.data.n) %>%
+  filter(!is.na(p_k_hot))
+
+# Get overall summary statisitics for each value of n that is being tested
+binom.summary.n <- binom.data.n %>%
+  group_by(n) %>%
+  summarise(Avg_p_k = mean(p_k_hot),
+            Avg_p_hat = mean(p_hat),
+            Avg_bias_p = mean(bias_p),
+            Avg_bias_p_hat = mean(bias_p_hat),
+            Avg_n_k = mean(n_k_hot))
+
+
+```
+
+This next chunk of code looks at what happens to all of the values of interest when we manipulate the probability parameter from .25 to .75 by steps of .05. The data frames that are created by this code are:
+
+1. binom.trials.p - a matrix of all of the binomial sequences (of 1s and 0s) generated with length 100 with different values of p
+2. binom.data.p - a data frame of summary data for each individual trial in binom.trials.p assuming a streak length of 3 to indicate "hotness" or "coldness"
+3. binom.summary.p - a data frame with aggregated data grouped by each value of p being looked at.
+
+```{r Binomial Data With Fixed n 100, k 3, changing p}
+# Generate binomial sequences for each probability value
+p <- seq(.25, .75, .05)
+binom.trials.p <- list()
+for (i in 1:length(p)) {
+  binom.trials.p[[i]] <- as.matrix(replicate(10000, rbinom(100, 1, p[i])))
+}
+
+# Generate calculated data for each sequence
+binom.data.p <- list()
+for (i in 1:length(p)) {
+  binom.data.p[[i]] <- bind_rows(future_apply(binom.trials.p[[i]], 2, bias.calc, n = 100, k = 3, pi = p[i]))
+}
+# Convert into 1 tibble
+binom.data.p <- bind_rows(binom.data.p) %>%
+  filter(!is.na(p_k_hot))
+
+# Get overall summary statisitics for for each value of p being observed
+binom.summary.p <- binom.data.p %>%
+  group_by(pi) %>%
+  summarise(Avg_p_k = mean(p_k_hot),
+            Avg_p_hat = mean(p_hat),
+            Avg_bias_p = mean(bias_p),
+            Avg_bias_p_hat = mean(bias_p_hat),
+            Avg_n_k = mean(n_k_hot))
+```
+
+Finally, two graphs to show how bias changes as n and p increase
+
+```{r Graphs For Binomial Data}
+# Bias on Changing n Graph
+ggplot(binom.summary.n) +
+  geom_point(aes(x = n, y = Avg_bias_p_hat)) +
+  ggtitle("Average Bias on Number of Shots Taken in a Trial") +
+  ylab("Bias Using PHat")
+# Bias on changing p graph
+ggplot(binom.summary.p) +
+  geom_point(aes(x = pi, y = Avg_bias_p_hat)) +
+  ggtitle("Average Bias on Shot Probability") +
+  ylab("Bias Using PHat") +
+  xlab("p")
+
+```
+
+## Simulation Using Permutations
+
+Next we will look at how changing n and p impacts bias numbers when using permutations instead of binomial generated sequences. This keeps the probability constant for each trial.
+
+First we look at what happens when the length of the sequence changes with a fixed probability of success of 0.5. The data frames created are:
+1. perm.trials.n - matrix of permuted sequences of 1s and 0s of length n and probability 0.5.
+2. perm.data.n - summary bias data for each of the sequences in perm.trials.n
+3. perm.summary.n - aggregated summary bias data for each of the values of n being looked at.
+
+```{r Permutations For Chaning n}
+# Create sequences with correct length and probability .5 for each value of n
+perm.sequences <- lapply(n, make_sequence, p = .5)
+# Permute each of these sequences 10,000 times
+perm.trials.n <- list()
+for (i in 1:length(perm.sequences)) {
+  perm.trials.n[[i]] <- as.matrix(replicate(10000, permute(perm.sequences[[i]])))
+}
+
+# Get data for each of these sequences
+perm.data.n <- list()
+for (i in 1:length(perm.sequences)) {
+  perm.data.n[[i]] <- future_apply(perm.trials.n[[i]], 2, bias.calc, n = n[i], k = 3, pi = .5)
+  perm.data.n[[i]] <- bind_rows(perm.data.n[[i]])
+}
+
+# Convert into 1 tibble
+perm.data.n <- bind_rows(perm.data.n) %>%
+  filter(!is.na(p_k_hot) & !is.na(p_k_cold))
+
+
+# Aggregate Summary Data
+perm.summary.n <- perm.data.n %>%
+  group_by(n) %>%
+  summarise(Avg_p_k = mean(p_k_hot),
+            Avg_p_hat = .5,
+            Avg_bias = mean(bias_p),
+            Avg_n_k = mean(n_k_hot))
+
+```
+
+Next, we look at the impact changing p has on bias. The data frames created are:
+1. perm.trials.p - matrix of permuted sequences of 1s and 0s of length 100 and different probabilities
+2. perm.data.p - summary bias data for each of the sequences in perm.trials.p
+3. perm.summary.p - aggregated summary bias data for each of the values of p being looked at.
+
+```{r Permutations or changing p}
+perm.sequences <- lapply(p, make_sequence, n = 100)
+perm.trials.p <- list()
+for (i in 1:length(perm.sequences)) {
+  perm.trials.p[[i]] <- as.matrix(replicate(10000, permute(perm.sequences[[i]])))
+}
+
+perm.data.p <- list()
+for (i in 1:length(perm.sequences)) {
+  perm.data.p[[i]] <- future_apply(perm.trials.p[[i]], 2, bias.calc, n = 100, k = 3, pi = p[i])
+  perm.data.p[[i]] <- bind_rows(perm.data.p[[i]])
+}
+
+# Convert into 1 tibble and get rid of sequences with no hot or cold streaks
+perm.data.p <- bind_rows(perm.data.p) %>%
+  filter(!is.na(p_k_hot) & !is.na(p_k_cold))
+
+  
+
+perm.summary.p <- perm.data.p %>%
+  group_by(pi) %>%
+  summarise(Avg_p_k = mean(p_k_hot),
+            Avg_p_hat = mean(p_hat),
+            Avg_bias = mean(bias_p),
+            Avg_n_k = mean(n_k_hot))
+```
+
+Finally, we look at how bias changes as n and p change using permutations.
+
+```{r Graphs For Permutation Data}
+# Bias on Changing n Graph
+ggplot(perm.summary.n) +
+  geom_point(aes(x = n, y = Avg_bias)) +
+  ggtitle("Average Bias on Number of Shots Taken in a Trial") +
+  ylab("Bias Using PHat")
+
+ggplot(perm.summary.p) +
+  geom_point(aes(x = p, y = Avg_bias)) +
+  ggtitle("Average Bias on Shot Probability") +
+  ylab("Bias Using PHat") +
+  xlab("p")
+```
+
+## Difference between Permuations and Binomial
+
+We now visually compare these bias calculations looking at the bias when calculated using binomial and permutation tests. 
+
+```{r Permutation and Binomial Graphs On Same Graph}
+ggplot() +
+  geom_point(data = perm.summary.n, aes(x = n, y = Avg_bias, color= "Permutation")) +
+  geom_point(data = binom.summary.n, aes(x = n, y = Avg_bias_p_hat, color = "Binomial")) +
+  ggtitle("Average Bias on Number of Attempts in a Trial") +
+  ylab("Bias") 
+
+ggplot() +
+  geom_point(data = perm.summary.p, aes(x = p, y = Avg_bias, color = "Permutation")) +
+  geom_point(data = binom.summary.p, aes(x = p, y = Avg_bias_p_hat, color = "Binomial")) +
+  ggtitle("Average Bias on Success Probability") +
+  ylab("Bias") +
+  xlab("p = Shot Probability")
+```

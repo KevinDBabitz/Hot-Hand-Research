@@ -1,0 +1,649 @@
+---
+title: "Using Streak Length to For Bias"
+output: html_document
+---
+
+## Import Libraries
+
+```{r}
+library(pacman)
+pacman::p_load(tidyverse, gtools, pbapply, future.apply, stargazer, ggsci)
+plan(multiprocess)
+```
+
+
+## Helper Functions
+
+These 2 functions are used in the other functions to help find different values of interest after a simulation is run. 
+
+1. find.runs(x) breaks a vector into a data frame of runs with starting and ending indices and the value of the run (1 or 0 in this case). 
+2. find.after.run.inds(x, k, value) finds the indices of all indices after a run of a specified value and length k and returns a vector of those runs.
+
+```{r Find Runs and After Run Indices}
+#Given a vector x, find the runs where a player made the shots
+find.runs = function(x) {
+  rle_x <- rle(x)
+  # Compute endpoints of run
+  len <- rle_x$lengths
+  end <- cumsum(len)
+  start <- c(1, end[-length(end)]+1)
+  data.frame(val=rle_x$values, len=len,start=start, end=end)
+}
+
+# Given a vector x, a streak length k, and a value (1 = make, 0 = miss) find 
+# The Indices after a streak (to see the result)
+# Return NaN if no runs
+find.after.run.inds <- function(x,k,value=1) {
+  runs <- find.runs(x)
+  
+  # Keep only runs of specified value 
+  # that have at least length k
+  runs <- runs[runs$len>=k & runs$val==value,,drop=FALSE]
+  
+  if (NROW(runs)==0)
+    return(NaN)
+  
+  # Index directly after runs of length k
+  inds <- runs$start+k
+  max.len <- max(runs$len)
+  len = k+1
+  while (len <= max.len) {
+    runs = runs[runs$len >= len,,drop=FALSE]
+    inds = c(inds,runs$start+len)
+    len = len+1
+  }
+  # ignore indices above n and sort for convenience
+  inds <- sort(inds[inds<=length(x)])
+  inds
+}
+```
+
+make_sequence(n, p, padding, k) creates a sequence of length n with probability of success (1) of p and failure (0) 1 - p. If padding is true, the sequence will have an additional k values added to the sequence that are simulated using a probability of p. If padding is true, the sequence is generated using a permutation and the padding is generated using a binomial. If it is false, the sequence is just n * p 1s and n * (1 - p) 0s in order and must be permuted after being called. 
+
+```{r Make a sequence to be permuted}
+make_sequence <- function(n, p, padding = FALSE, k = 3) {
+  if (padding) {
+    # assume will want permuted if padding is true
+    pad <- rbinom(k, 1, p)
+    seq <- c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p)))
+    seq <- permute(seq)
+    return (c(pad, seq))
+  }
+  else
+    return (c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p))))
+  
+}
+```
+
+
+bias.calc(x, n, k, pi. pad) finds all of the values of interest for our analysis of sequences. This function outputs a tibble with calculations for an individual sequence of 1s and 0s.  
+
+x - a vector of 1s and 0s, n represents the length of the sequence 
+k - the length of a "hot streak"
+pi - the true probability of a success for the sequence  
+pad - boolean value checking if we have a padding at the beginning of the sequence (padding is a sequence of shots to see if the player is hot before the first shot for calculations later). 
+
+
+```{r Simulation Function With Binomials}
+# Find the bias (shot prob after streak - overall shot probability)
+# X is a vector generated from a binomial
+bias.calc <- function(x, n, k, pi, pad = FALSE) {
+  # Find these indeces of x that come directly
+  # after a streak of k elements of specified value
+  hot.inds <- find.after.run.inds(x, k, value=1)
+  cold.inds <- find.after.run.inds(x, k, value=0)
+
+  if (pad) {
+    p_hat <- mean(x[4:length(x)])
+  } else {
+    p_hat <- mean(x)
+  }
+  
+  # If no run of at least k subsequent numbers of value exists
+  # return NULL (we will dismiss this observation)
+  tib <- tibble(pi = pi, 
+         n = n,
+         k = k,
+         p_k_hot = mean(x[hot.inds]),
+         p_k_cold = mean(x[cold.inds]),
+         p_hat = p_hat,
+         bias_p_hat = p_k_hot - p_hat,
+         bias_p = p_k_hot - pi,
+         hot_cold_bias = p_k_hot - p_k_cold,
+         n_k_hot = length(hot.inds),
+         n_k_cold = length(cold.inds)
+    )
+  tib$n_k_hot[which(is.na(tib$p_k_hot))] <- 0
+  tib$n_k_cold[which(is.na(tib$p_k_cold))] <- 0
+  return(tib)
+}
+```
+
+
+## Binomial Analysis
+
+We begin by creating binomial simulated sequences with probability of success ranging from .3 to .7 incrmented by .05 and different lengths from 50 to 200 with a 3 attempt "buffer" for each streak. This buffer acts as a way to see if the player is in a hot or cold state before taking their first shot.
+
+1. p - vector for probability values ranging from .3 to .7 with a step of .05.
+2. binom.trials.n50 - a matrix of 10000 trials for value of p in p of length 53. 
+2. binom.trials.n100 - a matrix of 10000 trials for value of p in p of length 103. 
+2. binom.trials.n200 - a matrix of 10000 trials for value of p in p of length 203. 
+
+```{r Generate Sequences for different values of n and p}
+p <- seq(0.3, .7, .05)
+# The trials for each n 50, 100, and 200
+binom.trials.n50 <- list()
+for (i in 1:length(p)) {
+ binom.trials.n50[[i]] <- as.matrix(replicate(10000, rbinom(53, 1, p[i])))
+}
+
+binom.trials.n100 <- list()
+for (i in 1:length(p)) {
+  binom.trials.n100[[i]] <- as.matrix(replicate(10000, rbinom(103, 1, p[i])))
+}
+
+binom.trials.n200 <- list()
+for (i in 1:length(p)) {
+  binom.trials.n200 [[i]] <- as.matrix(replicate(10000, rbinom(203, 1, p[i])))
+}
+```
+
+With these sequences, we would like to sovle for the number of shots taken on hot streaks and the actual bias (P(H | 3H) - P(H)) to see if we can use the number of streaks and the shooting probability to estimate the streak length. We use the bias.calc function to solve for these values and generae the following data frames. Each row in these data frames represents data for one trial:
+
+1. binom.data.n50 - bias calculations and number of hot streak shots taken calculations for each sequence of length 50 in binom.trials.n50.
+2. binom.data.n100 - bias calculations and number of hot streak shots taken calculations for each sequence of length 100 in binom.trials.n100.
+2. binom.data.n200 - bias calculations and number of hot streak shots taken calculations for each sequence of length 200 in binom.trials.n200.
+
+```{r}
+# the actual bias  for n = 50
+binom.data.n50 <- list()
+for (i in 1:length(p)) {
+  binom.data.n50[[i]] <- bind_rows(future_apply(binom.trials.n50[[i]], 2, bias.calc, n = 50, k = 3, pi = p[i], pad = TRUE))
+}
+# Convert into 1 tibble
+binom.data.n50 <- bind_rows(binom.data.n50)
+
+# the actual bias  for n = 100
+binom.data.n100 <- list()
+for (i in 1:length(p)) {
+  binom.data.n100[[i]] <- bind_rows(future_apply(binom.trials.n100[[i]], 2, bias.calc, n = 100, k = 3, pi = p[i], pad = TRUE))
+}
+# Convert into 1 tibble
+binom.data.n100 <- bind_rows(binom.data.n100)
+
+# the actual bias  for n = 200
+binom.data.n200 <- list()
+for (i in 1:length(p)) {
+  binom.data.n200[[i]] <- bind_rows(future_apply(binom.trials.n200[[i]], 2, bias.calc, n = 200, k = 3, pi = p[i], pad = TRUE))
+}
+# Convert into 1 tibble
+binom.data.n200 <- bind_rows(binom.data.n200)
+```
+
+We then aggregate these values with sum calculations. We sum all of the trials together. Each data frame has: 
+
+p_k_hot_sum -  the number of shots made on hot streaks
+k_sum - the total number of hot streaks
+one_over_k_sum - the sum of all 1 / k values
+num_no_streaks - the number of trials for each probability value that does not have any hot streaks
+sum_p_hat_bias - the sum of the difference between P(H | 3H) and P(H) for all the trials where P(H) is each individual trial's success percentage
+sum_p_bias - the sum of the difference between P(H | 3H) and P(H) for all the trials where P(H) is the true probability the sequence was generated with
+
+
+The data frames generated are:
+
+1. n50_binom_sums - aggregate data for sequences of length 50 grouped by probability
+2. n100_binom_sums - aggregate data for sequences of length 100 grouped by probability
+3. n200_binom_sums - aggregate data for sequences of length 200 grouped by probability
+
+```{r Getting summary sums for each probability to get conditional and multiplied sums}
+n50_binom_sums <- binom.data.n50 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE))
+
+n100_binom_sums <- binom.data.n100 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat = sum(p_hat),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE))
+
+n200_binom_sums <- binom.data.n200 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat = sum(p_hat),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE))
+
+```
+
+Finally, we aggregate this data into bias estimation calculations. We calcualte values of interest both using conditional and unconditional values for n. That is, we generated 10,000 trials but some of them don't have hot streaks in them (which makes 1 / k undefined). Unconditional calculations use 10,000 as the denominator for division calculations while conditional calculations use the number of seqeuences with streaks in them as the denominator.
+
+1. n50_binom_bias - bias estimation calculations for each probability value for sequences of length 50.
+2. n100_binom_bias - bias estimation calculations for each probability value for sequences of length 100.
+3. n200_binom_bias - bias estimation calculations for each probability value for sequences of length 200.
+
+```{r Bias Estimation Calculations}
+n50_binom_bias <- n50_binom_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / 10000,
+         unc_expected_1_over_k = one_over_k_sum / 10000,
+         unc_p_bias = sum_p_bias / 10000,
+         unc_p_hat_bias = sum_p_hat_bias / 10000) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (10000 - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (10000 - num_no_streaks),
+         cond_p_bias = sum_p_bias / (10000 - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (10000 - num_no_streaks)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (10000 - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / 10000
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # select important rows
+  select(pi, num_no_streaks, unc_expected_k, unc_expected_1_over_k, unc_k_bias, unc_p_bias, unc_p_hat_bias,
+         cond_expected_k, cond_expected_1_over_k, cond_k_bias, cond_p_bias, cond_p_hat_bias, cond_p_k_hot, unc_p_k_hot, recover) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+
+# n = 100
+n100_binom_bias <- n100_binom_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / 10000,
+         unc_expected_1_over_k = one_over_k_sum / 10000,
+         unc_p_bias = sum_p_bias / 10000,
+         unc_p_hat_bias = sum_p_hat_bias / 10000) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (10000 - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (10000 - num_no_streaks),
+         cond_p_bias = sum_p_bias / (10000 - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (10000 - num_no_streaks)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (10000 - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / 10000
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # select important rows
+  select(pi, num_no_streaks, unc_expected_k, unc_expected_1_over_k, unc_k_bias, unc_p_bias, unc_p_hat_bias,
+         cond_expected_k, cond_expected_1_over_k, cond_k_bias, cond_p_bias, cond_p_hat_bias, cond_p_k_hot, unc_p_k_hot, recover) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+
+n200_binom_bias <- n200_binom_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / 10000,
+         unc_expected_1_over_k = one_over_k_sum / 10000,
+         unc_p_bias = sum_p_bias / 10000,
+         unc_p_hat_bias = sum_p_hat_bias / 10000) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (10000 - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (10000 - num_no_streaks),
+         cond_p_bias = sum_p_bias / (10000 - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (10000 - num_no_streaks)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (10000 - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / 10000
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # select important rows
+  select(pi, num_no_streaks, unc_expected_k, unc_expected_1_over_k, unc_k_bias, unc_p_bias, unc_p_hat_bias,
+         cond_expected_k, cond_expected_1_over_k, cond_k_bias, cond_p_bias, cond_p_hat_bias, cond_p_k_hot, unc_p_k_hot, recover) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+```
+
+## Create Binomial Analysis Tables
+
+We change the names of the columns and select the interesting ones for table output. We add a _table suffix to these data frames.
+
+```{r For Easier Readability in the Tables}
+n50_binom_table <-  n50_binom_bias %>%
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+
+n100_binom_table <-  n100_binom_bias %>%
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+
+n200_binom_table <-  n200_binom_bias %>%
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+  
+```
+
+We then use stargazer package to generate tables for each bias calculation estimation.
+
+```{r Tables for Binomial sequences}
+stargazer(n50_binom_table, type = "html", summary = FALSE, out = "n50 Binomial Conditional and Unconditional Calculations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 50 with Binomials")  
+
+stargazer(n100_binom_table, type = "html", summary = FALSE, out = "n100 Binomial Conditional and Unconditional Calculations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 100 with Binomials")  
+
+stargazer(n200_binom_table, type = "html", summary = FALSE, out = "n200 Binomial Conditional and Unconditional Calculations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 200 with Binomials")  
+```
+
+
+## Permutation Analysis
+
+We Repeat the analysis above now using permuted sequences rather than binomial sequences with the same naming conventions.
+
+We begin by creating permuted sequences with probability of success ranging from .3 to .7 incrmented by .05 and different lengths from 50 to 200 with a 3 attempt "buffer" for each streak. This buffer acts as a way to see if the player is in a hot or cold state before taking their first shot. For these sequences, the buffer is generated by running 3 binomial trials with the current probability of success for the sequence to be permuted.
+
+1. p - vector for probability values ranging from .3 to .7 with a step of .05.
+2. perm.trials.n50 - a matrix of 10000 trials for value of p in p2 of length 53. 
+2. perm.trials.n100 - a matrix of 10000 trials for value of p in p of length 103. 
+2. perm.trials.n200 - a matrix of 10000 trials for value of p in p of length 203. 
+
+```{r Permutations For Conditional and Uncodnitional Bias Using Number of Streaks}
+# Need to use modified numbers for n = 50 or wont be able to create sequence that can be permuted
+p2 <- c(.3, .36, .4, .46, .5, .56, .6, .66, .7)
+
+# Create the trials
+perm.trials.n50 <- list()
+# 100,000 trials for n = 50 and p = .3 because unstable result otherwise
+perm.trials.n50[[1]] <- as.matrix(replicate(100000, make_sequence(50, .3, TRUE)))
+
+for (i in 2:length(p2)) {
+  perm.trials.n50[[i]] <- as.matrix(replicate(10000, make_sequence(50, p2[i], TRUE)))
+}
+
+perm.trials.n100 <- list()
+for (i in 1:length(p)) {
+  perm.trials.n100[[i]] <- as.matrix(replicate(10000, make_sequence(100, p[i], TRUE)))
+}
+
+perm.trials.n200 <- list()
+for (i in 1:length(p)) {
+  perm.trials.n200[[i]] <- as.matrix(replicate(10000, make_sequence(200, p[i], TRUE)))
+}
+```
+
+With these sequences, we would like to sovle for the number of shots taken on hot streaks and the actual bias (P(H | 3H) - P(H)) to see if we can use the number of streaks and the shooting probability to estimate the streak length. We use the bias.calc function to solve for these values and generae the following data frames. Each row in these data frames represents data for one trial:
+
+1. perm.data.n50 - bias calculations and number of hot streak shots taken calculations for each sequence of length 50 in perm.trials.n50.
+2. perm.data.n100 - bias calculations and number of hot streak shots taken calculations for each sequence of length 100 in perm.trials.n100.
+2. perm.data.n200 - bias calculations and number of hot streak shots taken calculations for each sequence of length 200 in perm.trials.n200.
+
+```{r}
+# Get the data for each trial
+perm.data.n50 <- list()
+for (i in 1:length(p2)) {
+  perm.data.n50[[i]] <- bind_rows(future_apply(perm.trials.n50[[i]], 2, bias.calc, n = 50, k = 3, pi = p2[i], pad = TRUE))
+}
+# Convert into 1 tibble
+perm.data.n50 <- bind_rows(perm.data.n50)
+
+perm.data.n100 <- list()
+for (i in 1:length(p)) {
+  perm.data.n100[[i]] <- bind_rows(future_apply(perm.trials.n100[[i]], 2, bias.calc, n = 100, k = 3, pi = p[i], pad = TRUE))
+}
+# Convert into 1 tibble
+perm.data.n100 <- bind_rows(perm.data.n100)
+
+perm.data.n200 <- list()
+for (i in 1:length(p)) {
+  perm.data.n200[[i]] <- bind_rows(future_apply(perm.trials.n200[[i]], 2, bias.calc, n = 200, k = 3, pi = p[i], pad = TRUE))
+}
+# Convert into 1 tibble
+perm.data.n200 <- bind_rows(perm.data.n200)
+```
+
+Finally, we aggregate this data into bias estimation calculations. We calcualte values of interest both using conditional and unconditional values for n. That is, we generated 10,000 trials but some of them don't have hot streaks in them (which makes 1 / k undefined). Unconditional calculations use 10,000 as the denominator for division calculations while conditional calculations use the number of seqeuences with streaks in them as the denominator.
+
+1. n50_binom_bias - bias estimation calculations for each probability value for sequences of length 50.
+2. n100_binom_bias - bias estimation calculations for each probability value for sequences of length 100.
+3. n200_binom_bias - bias estimation calculations for each probability value for sequences of length 200.
+
+```{r Permutation Calculations of Sums}
+n50_perm_sums <- perm.data.n50 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE),
+            n = n())
+
+n100_perm_sums <- perm.data.n100 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat = sum(p_hat),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE))
+
+n200_perm_sums <- perm.data.n200 %>% 
+  mutate(no_streak = as.numeric(n_k_hot == 0),
+         one_over_k = ifelse(no_streak == 1, 0, 1 / n_k_hot)) %>% 
+  group_by(pi) %>%
+  summarize(p_k_hot_sum = sum(p_k_hot, na.rm = TRUE),
+            k_sum = sum(n_k_hot, na.rm = TRUE),
+            one_over_k_sum = sum(one_over_k, na.rm = TRUE),
+            num_no_streaks = sum(no_streak),
+            sum_p_hat = sum(p_hat),
+            sum_p_hat_bias = sum(bias_p_hat, na.rm = TRUE),
+            sum_p_bias = sum(bias_p, na.rm = TRUE))
+```
+
+Finally, we aggregate this data into bias estimation calculations. We calcualte values of interest both using conditional and unconditional values for n. That is, we generated 10,000 trials but some of them don't have hot streaks in them (which makes 1 / k undefined). Unconditional calculations use 10,000 as the denominator for division calculations while conditional calculations use the number of seqeuences with streaks in them as the denominator.
+
+1. n50_perm_bias - bias estimation calculations for each probability value for sequences of length 50.
+2. n100_perm_bias - bias estimation calculations for each probability value for sequences of length 100.
+3. n200_perm_bias - bias estimation calculations for each probability value for sequences of length 200.
+
+```{r Permutation Summary Results}
+n50_perm_bias <- n50_perm_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / n,
+         unc_expected_1_over_k = one_over_k_sum / n,
+         unc_p_bias = sum_p_bias / n,
+         unc_p_hat_bias = sum_p_hat_bias / n) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (n - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (n - num_no_streaks),
+         cond_p_bias = sum_p_bias / (n - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (n)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (n - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / n
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # select important rows
+  select(pi, num_no_streaks, unc_expected_k, unc_expected_1_over_k, unc_k_bias, unc_p_bias, unc_p_hat_bias,
+         cond_expected_k, cond_expected_1_over_k, cond_k_bias, cond_p_bias, cond_p_hat_bias, cond_p_k_hot, unc_p_k_hot, recover) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+
+
+n100_perm_bias <- n100_perm_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / 10000,
+         unc_expected_1_over_k = one_over_k_sum / 10000,
+         unc_p_bias = sum_p_bias / 10000,
+         unc_p_hat_bias = sum_p_hat_bias / 10000) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (10000 - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (10000 - num_no_streaks),
+         cond_p_bias = sum_p_bias / (10000 - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (10000 - num_no_streaks)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (10000 - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / 10000
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # select important rows
+  select(pi, num_no_streaks, unc_expected_k, unc_expected_1_over_k, unc_k_bias, unc_p_bias, unc_p_hat_bias,
+         cond_expected_k, cond_expected_1_over_k, cond_k_bias, cond_p_bias, cond_p_hat_bias, cond_p_k_hot, unc_p_k_hot, recover) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+
+n200_perm_bias <- n200_perm_sums %>%
+  # unconditional averages
+  mutate(unc_expected_k = k_sum / 10000,
+         unc_expected_1_over_k = one_over_k_sum / 10000,
+         unc_p_bias = sum_p_bias / 10000,
+         unc_p_hat_bias = sum_p_hat_bias / 10000) %>%
+  # conditional averages
+  mutate(cond_expected_k = k_sum / (10000 - num_no_streaks),
+         cond_expected_1_over_k = one_over_k_sum / (10000 - num_no_streaks),
+         cond_p_bias = sum_p_bias / (10000 - num_no_streaks),
+         cond_p_hat_bias = sum_p_hat_bias / (10000 - num_no_streaks)) %>%
+  # hot streak shooting
+  mutate(cond_p_k_hot = p_k_hot_sum / (10000 - num_no_streaks),
+         unc_p_k_hot = p_k_hot_sum / 10000
+  ) %>%
+  # multiply together
+  mutate(unc_k_bias = unc_expected_k * unc_expected_1_over_k,
+         cond_k_bias = cond_expected_k * cond_expected_1_over_k) %>%
+  #See if can recover p
+  mutate(recover = (1 + cond_expected_1_over_k) * cond_p_k_hot) %>%
+  # Format For Table to display
+  mutate(unc_expected_k = round(unc_expected_k, 4), unc_expected_1_over_k = round(unc_expected_1_over_k, 4), unc_k_bias = round(unc_k_bias, 4), 
+         unc_p_bias = round(unc_p_bias, 4), cond_p_bias = round(cond_p_bias, 4), unc_p_hat_bias = round(unc_p_hat_bias, 4), 
+         cond_expected_k = round(cond_expected_k, 4), cond_expected_1_over_k = round(cond_expected_1_over_k, 4),
+         cond_k_bias = round(cond_k_bias, 4), cond_p_hat_bias = round(cond_p_hat_bias, 4), cond_p_k_hot = round(cond_p_k_hot, 4), 
+         unc_p_k_hot = round(unc_p_k_hot, 4), recover = round(recover, 4))
+ 
+```
+
+## Create Permutation Analysis 
+
+We change the names of the columns and select the interesting ones for table output. We add a _table suffix to these data frames.
+
+```{r Increase Readability of Columns with More Descriptive Names}
+n50_perm_table <- n50_perm_bias %>% 
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+
+n100_perm_table <- n100_perm_bias %>% 
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+
+n200_perm_table <- n200_perm_bias %>% 
+  select(pi, unc_expected_k, cond_expected_k, unc_expected_1_over_k, cond_expected_1_over_k, unc_p_k_hot, cond_p_k_hot, recover) %>%
+  rename("E(K)" = "unc_expected_k",
+         "E(K | K > 0)" = "cond_expected_k",
+         "E(1 / K)" = "unc_expected_1_over_k",
+         "E(1 / K | k > 0)" = "cond_expected_1_over_k",
+         "P-Hat(L)" = "unc_p_k_hot",
+         "Cond-P-hat(L)" = "cond_p_k_hot",
+         "(1 + E[1/K|K>0])*Cond-P-Hat(L)" = "recover")
+  
+```
+
+
+```{r Create Permutation Tables}
+stargazer(n50_perm_table, type = "html", summary = FALSE, out = "n50 Conditional and Unconditional Calculations Permutations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 50 with Permutations") 
+
+stargazer(n100_perm_table, type = "html", summary = FALSE, out = "n100 Conditional and Unconditional Calculations Permutations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 100 with Permutations") 
+
+stargazer(n200_perm_table, type = "html", summary = FALSE, out = "n200 Conditional and Unconditional Calculations Permutations.html",
+          column.sep.width ="1pt", digits = 3, digits.extra = 3,
+          title = "Bias Calculations for n = 200 with Permutations") 
+
+```
+
+

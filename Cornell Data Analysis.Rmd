@@ -1,0 +1,480 @@
+---
+title: "Cornell Data Analysis"
+output: html_document
+---
+
+## Import Required Libraries
+
+```{r}
+library(pacman)
+pacman::p_load(tidyverse, gtools, pbapply, future.apply)
+plan(multiprocess)
+```
+
+## Simulation Helper Functions
+
+These 2 functions are used in the other functions to help find different values of interest after a simulation is run. 
+
+1. find.runs(x) breaks a vector into a data frame of runs with starting and ending indices and the value of the run (1 or 0 in this case). 
+2. find.after.run.inds(x, k, value) finds the indices of all indices after a run of a specified value and length k and returns a vector of those runs.
+
+```{r Find Runs and After Run Indices}
+#Given a vector x, find the runs where a player made the shots
+find.runs = function(x) {
+  rle_x <- rle(x)
+  # Compute endpoints of run
+  len <- rle_x$lengths
+  end <- cumsum(len)
+  start <- c(1, end[-length(end)]+1)
+  data.frame(val=rle_x$values, len=len,start=start, end=end)
+}
+
+# Given a vector x, a streak length k, and a value (1 = make, 0 = miss) find 
+# The Indices after a streak (to see the result)
+# Return NaN if no runs
+find.after.run.inds <- function(x,k,value=1) {
+  runs <- find.runs(x)
+  
+  # Keep only runs of specified value 
+  # that have at least length k
+  runs <- runs[runs$len>=k & runs$val==value,,drop=FALSE]
+  
+  if (NROW(runs)==0)
+    return(NaN)
+  
+  # Index directly after runs of length k
+  inds <- runs$start+k
+  max.len <- max(runs$len)
+  len = k+1
+  while (len <= max.len) {
+    runs = runs[runs$len >= len,,drop=FALSE]
+    inds = c(inds,runs$start+len)
+    len = len+1
+  }
+  # ignore indices above n and sort for convenience
+  inds <- sort(inds[inds<=length(x)])
+  inds
+}
+```
+
+make_sequence(n, p, padding, k) creates a sequence of length n with probability of success (1) of p and failure (0) 1 - p. If padding is true, the sequence will have an additional k values added to the sequence that are simulated using a probability of p. If padding is true, the sequence is generated using a permutation and the padding is generated using a binomial. If it is false, the sequence is just n * p 1s and n * (1 - p) 0s in order and must be permuted after being called. 
+
+```{r Make a sequence to be permuted}
+make_sequence <- function(n, p, padding = FALSE, k = 3) {
+  if (padding) {
+    # assume will want permuted if padding is true
+    pad <- rbinom(k, 1, p)
+    seq <- c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p)))
+    seq <- permute(seq)
+    return (c(pad, seq))
+  }
+  else
+    return (c(rep(1, ceiling(n * p)), rep(0, n - ceiling(n * p))))
+  
+}
+```
+
+
+
+bias.calc(x, n, k, pi. pad) finds all of the values of interest for our analysis of sequences. This function outputs a tibble with calculations for an individual sequence of 1s and 0s.  
+
+x - a vector of 1s and 0s, n represents the length of the sequence 
+k - the length of a "hot streak"
+pi - the true probability of a success for the sequence  
+pad - boolean value checking if we have a padding at the beginning of the sequence (padding is a sequence of shots to see if the player is hot before the first shot for calculations later). 
+
+
+```{r Simulation Function With Binomials}
+# Find the bias (shot prob after streak - overall shot probability)
+# X is a vector generated from a binomial
+bias.calc <- function(x, n, k, pi, pad = FALSE) {
+  # Find these indeces of x that come directly
+  # after a streak of k elements of specified value
+  hot.inds <- find.after.run.inds(x, k, value=1)
+  cold.inds <- find.after.run.inds(x, k, value=0)
+
+  if (pad) {
+    p_hat <- mean(x[4:length(x)])
+  } else {
+    p_hat <- mean(x)
+  }
+  
+  # If no run of at least k subsequent numbers of value exists
+  # return NULL (we will dismiss this observation)
+  tib <- tibble(pi = pi, 
+         n = n,
+         k = k,
+         p_k_hot = mean(x[hot.inds]),
+         p_k_cold = mean(x[cold.inds]),
+         p_hat = p_hat,
+         bias_p_hat = p_k_hot - p_hat,
+         bias_p = p_k_hot - pi,
+         hot_cold_bias = p_k_hot - p_k_cold,
+         n_k_hot = length(hot.inds),
+         n_k_cold = length(cold.inds)
+    )
+  tib$n_k_hot[which(is.na(tib$p_k_hot))] <- 0
+  tib$n_k_cold[which(is.na(tib$p_k_cold))] <- 0
+  return(tib)
+}
+```
+
+## Getting Started With the Cornell Data
+
+We will be conducting permutation testing and binomial testing with the cornell basketball player data from the Gilovich, Vallone, and Tversky (GVT) (1985) paper using bias adjustments to test for the existence of the hot hand.
+
+We begin by creating 10,000 binomial generated sequences and permuted sequences from the shooting probabilities observed in the 1985 GVT paper.
+
+1. c_data - Original data from the GVT paper
+2. cornell.trials.b - matrix of binomial generated sequences for each player in the GVT data.
+3. cornell.trials.p - matrix of permuted sequences for each player in the GVT data
+
+```{r Read in the Data and Make Binomial and Permutation Data For Each Player}
+c_data <- read_csv("Data/Cornell Data.csv") 
+# remove average row
+c_data <- filter(c_data, Player != "M")
+
+# Binomials
+cornell.trials.b <- list()
+for (i in 1:length(c_data$PH)) {
+  cornell.trials.b[[i]] <- as.matrix(replicate(10000, rbinom(100, 1, c_data$PH[i])))
+}
+
+# Permutations
+cornell.sequences <- lapply(c_data$PH, make_sequence, n = 100)
+cornell.trials.p <- list()
+for (i in 1:length(cornell.sequences)) {
+  cornell.trials.p[[i]] <- as.matrix(replicate(10000, permute(cornell.sequences[[i]])))
+}
+```
+
+## Bias Calculations for the Cornell Data Using Binomials
+
+First, we calculate the bias for the Cornell players using binomials for each seqeunce in cornell.trials.b
+1. cornell.data.binom - bias data for each sequence in cornell.trials.b 
+
+```{r Binomial Data For Cornell Players}
+cornell.data.binom <- list()
+for (i in 1:length(c_data$PH)) {
+  cornell.data.binom[[i]] <- bind_rows(future_apply(cornell.trials.b[[i]], 2, bias.calc, n = 100, k = 3, pi = c_data$PH[i])) %>%
+    mutate(Player = c_data$Player[i])
+}
+
+# Convert into 1 tibble
+cornell.data.binom <- bind_rows(cornell.data.binom) %>%
+  filter(!is.na(p_k_hot))
+```
+
+
+## Bias Calculations for the Cornell Data Using Permutations
+
+Next, we calculate the bias for the players using permutations for each sequence in cornell.trials.p.
+1. cornell.data.perm - bias data for each sequence in cornell.trials.p
+
+```{r Permutation Data For Cornell Players}
+cornell.data.perm <- list()
+for (i in 1:length(c_data$Player)) {
+  cornell.data.perm[[i]] <- future_apply(cornell.trials.p[[i]], 2, bias.calc, n = 100, k = 3, pi = c_data$PH[i])
+  cornell.data.perm[[i]] <- bind_rows(cornell.data.perm[[i]]) %>%
+    mutate(Player = c_data$Player[i])
+}
+
+# Convert into 1 tibble
+cornell.data.perm <- bind_rows(cornell.data.perm) %>%
+  filter(!is.na(p_k_hot))
+```
+
+
+## bias adjustments for Cornell Dat
+
+add bias calculations from the actual GVT data.
+
+```{r}
+# Bias calculations using GVT Data
+c_data <- c_data %>%
+  mutate(act_hot_cold_bias = PH3H - PH3M,
+         act_p_bias = PH3H - PH)
+```
+
+
+## p-value Calculations
+
+Now we would like to see how often the players' bias values were more extreme than what is seen in the binom.data and perm.data. This will give us a way to calculate p-values for the significance of "hotness" the player displayed during the experiment. We add 1s and 0s to the cornell.data.binom and cornell.data.perm tibbles. If the value is 1, then the actual value was more extreme than that trial and 0 if not as extreme. After this, we will find the average of this column for each player to find the p-value.   
+
+```{r}
+# p-value calculations for binomial data (for both hot_cold and marginal with p and p_hat)
+cornell.data.binom <- cornell.data.binom %>%
+  left_join(select(c_data, Player, act_hot_cold_bias, act_p_bias), by = "Player") %>%
+  mutate(binom_hot_cold_pval = as.numeric(act_hot_cold_bias < hot_cold_bias),
+         binom_p_bias_pval = as.numeric(act_p_bias < bias_p),
+         binom_phat_bias_pval = as.numeric(act_p_bias < bias_p_hat))
+
+# p-value calculations for permutation data (for both hot_cold and marginal)
+cornell.data.perm <- cornell.data.perm %>%
+  left_join(select(c_data, Player, act_hot_cold_bias, act_p_bias), by = "Player") %>%
+  mutate(perm_hot_cold_pval = as.numeric(act_hot_cold_bias < hot_cold_bias),
+         perm_p_bias_pval = as.numeric(act_p_bias < bias_p))
+```
+
+
+## Bias Adjustment and p values
+
+We then find the bias adjustment values from the data generated in the previous section. These bias calculations include the difference between hot and cold shooting probabilities (P(H | 3H) - P(H | 3M)) named hot_cold_bias in the tibble and the difference between hot and marginal shooting percentages (P(H | 3H) - P(H)) named p_bias. For the binomial case, we also calculate the average difference in hot shooting percentage and the individual trial's shooting percentage which is called phat_bias.
+
+We also calculate the p value for hotness of each player for marginal and hot and cold differences. 
+
+1. cornell.summary.binom - aggregated bias calculation numbers for each cornell basketball player using binomial data
+2. cornell.summary.perm - aggregated bias calculatuon numbers for each cornell basketball player using permutation data
+
+```{r Bias Adjustments Calculations}
+# Bias calculations for binomial simulation data
+cornell.summary.binom <- cornell.data.binom %>%
+  filter(!is.na(p_k_hot)) %>%
+  filter(!is.na(p_k_cold)) %>%
+  group_by(Player) %>%
+  summarise(binom_phat_bias = mean(bias_p_hat),
+            binom_p_bias = mean(bias_p),
+            binom_hot_cold_bias = mean(hot_cold_bias),
+            binom_p_pval = mean(binom_p_bias_pval),
+            binom_phat_pval = mean(binom_phat_bias_pval),
+            binom_hot_cold_pval = mean(binom_hot_cold_pval))
+
+# Bias calculations for permutation data
+cornell.summary.perm <- cornell.data.perm %>%
+  filter(!is.na(p_k_hot)) %>%
+  filter(!is.na(p_k_cold)) %>%
+  group_by(Player) %>%
+  summarise(perm_p_bias = mean(bias_p),
+            perm_hot_cold_bias = mean(hot_cold_bias),
+            perm_hot_cold_pval = mean(perm_hot_cold_pval),
+            perm_p_bias_pval = mean(perm_p_bias_pval))
+```
+
+## Combine all of the data into one table 
+
+cornell_player_simulation_data has all of the aggregate data for each player and the original GVT data in one table for easy access to all of the data we want later in the analysis
+
+```{r put all the aggregated data together}
+cornell_player_simulation_data <- c_data %>% 
+  select(Player, PH3M, PH, PH3H, act_hot_cold_bias, act_p_bias) %>%
+  left_join(select(cornell.summary.binom, Player, binom_phat_bias, binom_p_bias, binom_hot_cold_bias, binom_p_pval, binom_phat_pval, binom_hot_cold_pval), by = "Player") %>%
+  left_join(select(cornell.summary.perm, Player, perm_p_bias, perm_hot_cold_bias, perm_hot_cold_pval, perm_p_bias_pval), by = "Player")
+  
+```
+
+## Find A T-Statistic for Difference between hot and cold shooting percentages and Marginal difference
+
+Next, we'd like to get an overall significance of hotness score for all of the players in the data.
+We first create functions to help find a t-statistic for hot and cold shooting percentages.
+
+1. trial_diff(x) - permutes a vector (x) until it has a hot and cold streak and then calculates the difference
+2. one_step(exclude) - solves for a t statistic value for one run through all 26 players. If exclude has a vector input, it will exlcude those players whose indices match the exclude indices. 
+3. t_dist - distribution of 10,000 steps with all 26 players. This will be used to solve for a t-statisitc later
+
+```{r Find an Overall T-Statistic for the players With P(H|3H) - P(H|3M)}
+trial_diff <- function(x) {
+  # permute the vector x
+  permuted_sequence <- permute(x)
+  # find hot and cold indices for this sequence
+  inds.hot <- find.after.run.inds(permuted_sequence, k = 3, value=1)
+  inds.cold <- find.after.run.inds(permuted_sequence, k = 3, value=0)
+  # Keep permuting the sequence until it has at least one hot and one cold streak (so we don't get na for calculations)
+  while (length(inds.hot) == 0 | length(inds.cold) == 0 | is.na(mean(permuted_sequence[inds.hot]) - mean(permuted_sequence[inds.cold]))){
+    permuted_sequence <- permute(x)
+    inds.hot <- find.after.run.inds(permuted_sequence, k = 3, value=1)
+    inds.cold <- find.after.run.inds(permuted_sequence, k = 3, value=0)
+  }
+  # Find the difference in hot and cold shooting percentages for the permuted sequence
+  mean(permuted_sequence[inds.hot]) - mean(permuted_sequence[inds.cold])
+}
+
+# One calculation of the distribution for the t-statisitc (will create a distribution of many of these to get a t-statistic)
+# exclude is a vector of players to exclude from the analysis, defualt is NULL
+one_step <- function(exclude = NULL) {
+  # get a difference in hot and cold shooting for each player who is not excluded
+  if (is.null(exclude)) {
+    theta_i <- lapply(cornell.sequences, trial_diff)
+    adj_i <- as.numeric(theta_i) - cornell_player_simulation_data$perm_hot_cold_bias
+  } 
+  else {
+    theta_i <- lapply(cornell.sequences[-exclude], trial_diff)
+    adj_i <- as.numeric(theta_i) - cornell_player_simulation_data$perm_hot_cold_bias[-exclude]
+  }
+  # Adjust these differences using the permutation bias adjustment to get bias adjusted values
+  
+  # t value for the trial 
+  return(mean(adj_i) / (sd(adj_i) / sqrt(length(adj_i))))
+}
+
+# create a distribution of 10000 of these steps
+t_dist <- future_replicate(10000, one_step(), exclude = NULL)
+
+```
+
+We then create functions for marginal difference that do the same thing as above but use P(H | 3H) - P(H) rather than hot and cold differences.
+
+1. trial_diff_marginal - permutes a vector (x) until it has a hot streak and then calculates the difference
+2. one_step_marginal - solves for a t statistic value for one run through all 26 players. If exclude has a vector input, it will exlcude those players whose indices match the exclude indices. 
+3. t_dist_marginal - distribution of 10,000 steps with all 26 players. This will be used to solve for a t-statisitc later
+
+```{r Find an Overall T-Statistic for the players With P(H|3H) - P(H) - Marginal}
+
+trial_diff_marginal <- function(x) {
+  permuted_sequence <- permute(x)
+  inds.hot <- find.after.run.inds(permuted_sequence, k = 3, value=1)
+  # loop until have a hot streak to caclulate the difference on 
+  while (length(inds.hot) == 0 | is.na(mean(permuted_sequence[inds.hot]) - mean(permuted_sequence))){
+    permuted_sequence <- permute(x)
+    inds.hot <- find.after.run.inds(permuted_sequence, k = 3, value=1)
+  }
+  # Find the difference in hot and cold shooting percentages for the permuted sequence
+  mean(permuted_sequence[inds.hot]) - mean(permuted_sequence)
+}
+
+
+one_step_marginal <- function(exclude = NULL) {
+   # get a difference in hot and cold shooting for each player who is not excluded
+  if (is.null(exclude)) {
+    theta_i <- lapply(cornell.sequences, trial_diff_marginal)
+    adj_i <- as.numeric(theta_i) - cornell_player_simulation_data$perm_p_bias
+  } 
+  else {
+    theta_i <- lapply(cornell.sequences[-exclude], trial_diff_marginal)
+    adj_i <- as.numeric(theta_i) - cornell_player_simulation_data$perm_p_bias[-exclude]
+  }
+  
+  # Adjust these differences using the permutation bias adjustment to get bias adjusted values
+ 
+  
+  #z value for the trial
+  return(mean(adj_i) / (sd(adj_i) / sqrt(length(adj_i))))
+}
+
+t_dist_marginal <- future_replicate(10000, one_step_marginal(), exclude = NULL)
+```
+
+# Overall Significance Testing with All Players
+
+1. t_stat - t-statistic from all of the 25 players using the t_dist variable created before
+2. t_stat_marginal - t-statistic from all 25 player using t_dist_marginal variable created before
+3. f - fisher value using all 25 players and hot cold difference
+4. f_marginal - fisher value using all 25 players and hot and marginal difference
+5. x - staufer calculation using hot cold difference
+6. x_marginal - staufer calculation using hot marginal difference
+
+```{r Significance Testing for P(H|3H) - P(H|3M)}
+
+# T-Stat
+t_stat <- cornell_player_simulation_data %>%
+  mutate(adjusted = act_hot_cold_bias - perm_hot_cold_bias) %>%
+  filter(!is.na(adjusted)) %>%
+  summarise(t_stat = mean(adjusted) / (sd(adjusted) / 5))
+t_stat <- t_stat$t_stat
+
+# p-value for t test with hot cold difference
+paste("P-Value for t-test with hot and cold:", 1 - mean(as.numeric(t_dist < t_stat)))
+
+t_stat_marginal <- cornell_player_simulation_data %>%
+  mutate(adjusted = act_p_bias - perm_p_bias) %>%
+  filter(!is.na(adjusted)) %>%
+  summarise(t_stat = mean(adjusted) / (sd(adjusted) / 5))
+t_stat_marginal <- t_stat_marginal$t_stat
+
+# p-value for t test with marginal difference
+paste("P-Value for t-test with marignal:" ,1 - mean(as.numeric(t_dist_marginal < t_stat_marginal), na.rm = TRUE))
+
+
+# Fisher
+f <- -2 * log(prod(cornell_player_simulation_data$perm_hot_cold_pval, na.rm = TRUE))
+paste("Hot and Cold Fisher Value:", 1 - pchisq(f, 50))
+
+f_marginal <- -2 * log(prod(cornell_player_simulation_data$perm_p_bias_pval, na.rm = TRUE))
+paste("Marginal Fisher Value:", 1 - pchisq(f_marginal, 50))
+
+
+# Staufer's
+x <- sum(qnorm(cornell_player_simulation_data$perm_hot_cold_pval), na.rm = TRUE) / 5
+paste("Hot and Cold Staufer's:", pnorm(x))
+
+x_marginal <- sum(qnorm(cornell_player_simulation_data$perm_p_bias_pval), na.rm = TRUE) / 5
+paste("Marginal Stafer's:", pnorm(x_marginal))
+
+#Bonferoni 
+print("Sorted perm p-values")
+sort(cornell_player_simulation_data$perm_hot_cold_pval)
+```
+# Visualization of Significance
+
+distribution(pl) - input the index number of the player whose distribution of hot and cold permutation differences you would like to see and get a histogram of it with a vertical line for where the player's actual difference was in the GVT paper.
+
+```{r}
+
+#plot of the T statistic found above
+ggplot() +
+  geom_histogram(aes(t_dist), binwidth = .1) +
+  geom_vline(xintercept = t_stat) +
+  ggtitle("T Distribution for all 26 Players") +
+  xlab("T")
+
+distribution <- function(pl) {
+  cornell.data.perm %>%
+    filter(Player == c_data$Player[[pl]]) %>%
+    mutate(diff = p_k_hot - p_k_cold) %>%
+  ggplot(aes(x = diff)) +
+    geom_histogram(binwidth = .03) +
+    geom_vline(xintercept = c_data$PH3H[pl] - c_data$PH3M[pl]) +
+    ggtitle(paste0("Player ", c_data$Player[pl], " distribution of Differences")) +
+    xlab("difference hot and cold")
+}
+
+# Change the parameter to look at a different player
+distribution(9)
+
+```
+
+# Overall Significance Testing without the Very Significant Player
+
+The overall significance of the result seems to be driven by the extremely significant player 9. If we remove him, is there still a significant result?
+
+This is the same analysis as above and all of the variales are named the same with a _excluded suffix added to signify that the 9th player is removed from the distributions and vectors
+
+```{r}
+t_dist_exluded <- future_replicate(10000, one_step_marginal(), exclude = c(9))
+t_dist_marginal_excluded <- future_replicate(10000, one_step_marginal(), exclude = c(9))
+
+t_stat_excluded <- cornell_player_simulation_data %>%
+  filter(Player != "M9") %>%
+  mutate(adjusted = act_hot_cold_bias - perm_hot_cold_bias) %>%
+  filter(!is.na(adjusted)) %>%
+  summarise(t_stat = mean(adjusted) / (sd(adjusted) / sqrt(24)))
+t_stat_excluded <- t_stat_excluded$t_stat
+
+# p-value for t test with hot cold difference
+paste("P-Value for t-test with hot and cold:", 1 - mean(as.numeric(t_dist_exluded < t_stat)))
+
+t_stat_marginal_excluded <- cornell_player_simulation_data %>%
+  filter(Player != "M9") %>%
+  mutate(adjusted = act_p_bias - perm_p_bias) %>%
+  filter(!is.na(adjusted)) %>%
+  summarise(t_stat = mean(adjusted) / (sd(adjusted) / sqrt(24)))
+t_stat_marginal_excluded <- t_stat_marginal_excluded$t_stat
+
+# p-value for t test with marginal difference
+paste("P-Value for t-test with marignal:" ,1 - mean(as.numeric(t_dist_marginal_excluded < t_stat_marginal), na.rm = TRUE))
+
+
+# Fisher
+f_excluded <- -2 * log(prod(cornell_player_simulation_data$perm_hot_cold_pval[-9], na.rm = TRUE))
+paste("Hot and Cold Fisher Value:", 1 - pchisq(f_excluded, 48))
+
+f_marginal_excluded <- -2 * log(prod(cornell_player_simulation_data$perm_p_bias_pval[-9], na.rm = TRUE))
+paste("Marginal Fisher Value:", 1 - pchisq(f_marginal_excluded, 48))
+
+
+# Staufer's
+x_excluded <- sum(qnorm(cornell_player_simulation_data$perm_hot_cold_pval[-9]), na.rm = TRUE) / sqrt(24)
+paste("Hot and Cold Staufer's:", pnorm(x_excluded))
+
+x_marginal_excluded <- sum(qnorm(cornell_player_simulation_data$perm_p_bias_pval[-9]), na.rm = TRUE) / sqrt(24)
+paste("Marginal Stafer's:", pnorm(x_marginal_excluded))
+```
